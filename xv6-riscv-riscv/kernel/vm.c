@@ -299,23 +299,28 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  char *mem;
 
   for(i = 0; i < sz; i += PGSIZE){
     if((pte = walk(old, i, 0)) == 0)
       continue;   // page table entry hasn't been allocated
     if((*pte & PTE_V) == 0)
       continue;   // physical page hasn't been allocated
+
     pa = PTE2PA(*pte);
     flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
-      goto err;
+
+    if(flags & PTE_W){
+      flags = (flags & ~PTE_W) | PTE_COW;
+      *pte = PA2PTE(pa) | flags;
     }
+
+    if(mappages(new, i, PGSIZE, pa, flags) != 0)
+      goto err;
+
+    kaddref((void*)pa);
   }
+
+  sfence_vma();
   return 0;
 
  err:
@@ -349,19 +354,26 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
     va0 = PGROUNDDOWN(dstva);
     if(va0 >= MAXVA)
       return -1;
-  
+
     pa0 = walkaddr(pagetable, va0);
     if(pa0 == 0) {
-      if((pa0 = vmfault(pagetable, va0, 0)) == 0) {
+      if((pa0 = vmfault(pagetable, va0, 0)) == 0)
         return -1;
-      }
     }
 
     pte = walk(pagetable, va0, 0);
-    // forbid copyout over read-only user text pages.
-    if((*pte & PTE_W) == 0)
+    if(pte == 0 || (*pte & PTE_V) == 0 || (*pte & PTE_U) == 0)
       return -1;
-      
+
+    if((*pte & PTE_W) == 0){
+      if((*pte & PTE_COW) == 0)
+        return -1;
+      pa0 = cow_alloc(pagetable, va0);
+      if(pa0 == 0)
+        return -1;
+      pte = walk(pagetable, va0, 0);
+    }
+
     n = PGSIZE - (dstva - va0);
     if(n > len)
       n = len;
@@ -443,6 +455,46 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
   } else {
     return -1;
   }
+}
+
+uint64
+cow_alloc(pagetable_t pagetable, uint64 va)
+{
+  pte_t *pte;
+  uint64 pa;
+  uint flags;
+  char *mem;
+
+  va = PGROUNDDOWN(va);
+  pte = walk(pagetable, va, 0);
+  if(pte == 0)
+    return 0;
+  if((*pte & (PTE_V|PTE_U)) != (PTE_V|PTE_U))
+    return 0;
+  if((*pte & PTE_COW) == 0)
+    return 0;
+
+  pa = PTE2PA(*pte);
+  flags = PTE_FLAGS(*pte);
+
+  if(kgetref((void*)pa) == 1){
+    flags = (flags | PTE_W) & ~PTE_COW;
+    *pte = PA2PTE(pa) | flags;
+    sfence_vma();
+    return pa;
+  }
+
+  mem = kalloc();
+  if(mem == 0)
+    return 0;
+
+  memmove(mem, (void*)pa, PGSIZE);
+  flags = (flags | PTE_W) & ~PTE_COW;
+  *pte = PA2PTE(mem) | flags;
+  sfence_vma();
+  kfree((void*)pa);
+
+  return (uint64)mem;
 }
 
 // allocate and map user memory if process is referencing a page
